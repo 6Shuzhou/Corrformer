@@ -1,8 +1,8 @@
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
 python -u run.py \
   --is_training 1 \
-  --root_path ./dataset/global_temp/ \
+  --root_path /data/global_temp/ \
   --data_path None \
   --model_id global_temp_48_24_1ETCN_1DTCN \
   --model Corrformer \

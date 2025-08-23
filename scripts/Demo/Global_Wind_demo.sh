@@ -1,8 +1,8 @@
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=0
 
 python -u run.py \
   --is_training 0 \
-  --root_path ./dataset/global_wind/ \
+  --root_path /data/global_wind/ \
   --data_path None \
   --model_id global_wind_48_24_1ETCN_1DTCN \
   --model Corrformer \

@@ -8,6 +8,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
+from tqdm import tqdm
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
+
+# import ipdb
 
 import os
 import time
@@ -27,11 +31,15 @@ class Exp_Main(Exp_Basic):
         model_dict = {
             'Corrformer': Corrformer,
         }
+        
         model = model_dict[self.args.model].Model(self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
+    
+    
+    
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
@@ -45,46 +53,70 @@ class Exp_Main(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _clip_to_physical_range(self, x, min_v: float = 0.0, max_v: float = 100.0):
+        """Clamp tensor predictions to a physical range [min_v, max_v].
+        Used only at evaluation/inference time to avoid out-of-range values.
+        """
+        if isinstance(x, torch.Tensor):
+            return torch.clamp(x, min=min_v, max=max_v)
+        return x
+
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn()
+            ) as progress:
+                total_batches = len(vali_loader)
+                task = progress.add_task("Validating...", total=total_batches)
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    batch_y = batch_y.float()
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                    # decoder input
+                    dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                    # encoder - decoder
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if self.args.output_attention or self.args.model.count('Consistency') > 0:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
                         if self.args.output_attention or self.args.model.count('Consistency') > 0:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
+                            # ipdb.set_trace()
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention or self.args.model.count('Consistency') > 0:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    # ipdb.set_trace()
+                    # Clamp outputs to physical humidity bounds [0, 100] during validation
+                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                pred = outputs.detach().cpu()
-                true = batch_y.detach().cpu()
+                    pred = outputs.detach().cpu()
+                    true = batch_y.detach().cpu()
 
-                loss = criterion(pred, true)
+                    loss = criterion(pred, true)
 
-                total_loss.append(loss)
+                    total_loss.append(loss)
+
+                    progress.update(task, advance=1)
+                    
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
 
-    def train(self, setting):
+    def train(self, setting, load_pretrained=True):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
@@ -92,6 +124,53 @@ class Exp_Main(Exp_Basic):
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
+        
+        if self.args.use_gpu:
+           self.model = self.model.cuda()    
+           
+        # if self.args.pretrained_model == '':
+        #    ckpt = torch.load(os.path.join('data/' + setting, 'checkpoint.pth'))
+        # else:
+        #     ckpt = torch.load(os.path.join('data/' + self.args.pretrained_model,
+        #                                'checkpoint.pth'))
+    
+        #     model_dict = self.model.state_dict()
+        #     matched_dict = {
+        #            k: v for k, v in ckpt.items()
+        #          if k in model_dict and v.size() == model_dict[k].size()
+        #     }
+
+        #     model_dict.update(matched_dict)
+        #     self.model.load_state_dict(model_dict)
+            
+
+        #     print('loading model finished')   
+           
+
+    
+        # print("Standard full fine-tuning. All parameters are trainable.")
+        # for param in self.model.parameters():
+        #     param.requires_grad = True
+        
+        # # --- 打印参数状态以供检查 ---
+        # print("\n" + "="*25 + " Model Parameters Status " + "="*25)
+        # trainable_params = 0
+        # total_params = 0
+        # trainable_layers = []
+        
+        # for name, param in self.model.named_parameters():
+        #     total_params += param.numel()
+        #     if param.requires_grad:
+        #         trainable_params += param.numel()
+        #         trainable_layers.append(name)
+        
+        # print(f"Total parameters: {total_params:,}")
+        # print(f"Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+        # print(f"\nTrainable layers/parameters ({len(trainable_layers)}):")
+        # for name in trainable_layers:
+        #     print(f"  - {name}")
+        # print("="*75 + "\n")
+
 
         time_now = time.time()
 
@@ -109,22 +188,41 @@ class Exp_Main(Exp_Basic):
             train_loss = []
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
-                iter_count += 1
-                model_optim.zero_grad()
-                batch_x = batch_x.float().to(self.device)
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn()
+            ) as progress:
+                total_batches = len(train_loader)
+                task = progress.add_task("Training(" + str(epoch) + "/"+ str(self.args.train_epochs) +")...", total=total_batches)
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                    iter_count += 1
+                    model_optim.zero_grad()
+                    batch_x = batch_x.float().to(self.device)
 
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                    batch_y = batch_y.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                    # decoder input
+                    dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                    # encoder - decoder
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                            f_dim = -1 if self.args.features == 'MS' else 0
+                            batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                            loss = criterion(outputs, batch_y)
+                            train_loss.append(loss.item())
+                    else:
                         if self.args.output_attention:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
@@ -134,32 +232,25 @@ class Exp_Main(Exp_Basic):
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+
+                    if (i + 1) % 100 == 0:
+                        print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                        speed = (time.time() - time_now) / iter_count
+                        left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                        print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                        iter_count = 0
+                        time_now = time.time()
+
+                    if self.args.use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.step(model_optim)
+                        scaler.update()
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        loss.backward()
+                        model_optim.step()
 
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
-
-                if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
-
-                if self.args.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    model_optim.step()
+                    progress.update(task, advance=1)
+                    
             # torch.save(self.model.state_dict(), path + '/' + 'checkpoint.pth')
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -182,12 +273,24 @@ class Exp_Main(Exp_Basic):
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
-            print('loading model')
+            # self.model.load_state_dict(torch.load(os.path.join(self.args.pretrained_model, 'checkpoint.pth')))
+            print('loading model (non-strict)')
             if self.args.pretrained_model == '':
-                self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+                  ckpt = torch.load(os.path.join('data/' + setting, 'checkpoint.pth'))
             else:
-                self.model.load_state_dict(
-                    torch.load(os.path.join('./checkpoints/' + self.args.pretrained_model, 'checkpoint.pth')))
+                  ckpt = torch.load(os.path.join('data/' + self.args.pretrained_model,
+                                       'checkpoint.pth'))
+    
+            model_dict = self.model.state_dict()
+            matched_dict = {
+                   k: v for k, v in ckpt.items()
+                 if k in model_dict and v.size() == model_dict[k].size()
+            }
+
+            model_dict.update(matched_dict)
+            self.model.load_state_dict(model_dict)
+            
+
             print('loading model finished')
 
         folder_path = './test_results/' + setting + '/'
@@ -199,44 +302,57 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn()
+            ) as progress:
+                total_batches = len(test_loader)
+                task = progress.add_task("Testing...", total=total_batches)
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    batch_y = batch_y.float().to(self.device)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                    # decoder input
+                    dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                    # encoder - decoder
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                # metric
-                f_dim = -1 if self.args.features == 'MS' else 0
+                    # Clamp outputs to physical humidity bounds [0, 100] during testing
+                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
 
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                pred = outputs.detach().cpu().numpy()
-                true = batch_y.detach().cpu().numpy()
-                if self.args.test_features == 'S_station':
-                    pred = pred[:, :, self.args.target:(self.args.target + 1)]
-                    true = true[:, :, self.args.target:(self.args.target + 1)]
+                    # metric
+                    f_dim = -1 if self.args.features == 'MS' else 0
 
-                tmp_mae, tmp_mse = simple_metric(pred, true)
-                mse += tmp_mse
-                mae += tmp_mae
-                batch_num += 1
-                # visual
-                input = batch_x.detach().cpu().numpy()
-                gt = np.concatenate((input[0, :, 100], true[0, :, 100]), axis=0)
-                pd = np.concatenate((input[0, :, 100], pred[0, :, 100]), axis=0)
-                visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
-                if i % 10 == 0:
-                    print("batch: " + str(i))
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    pred = outputs.detach().cpu().numpy()
+                    true = batch_y.detach().cpu().numpy()
+                    if self.args.test_features == 'S_station':
+                        pred = pred[:, :, self.args.target:(self.args.target + 1)]
+                        true = true[:, :, self.args.target:(self.args.target + 1)]
+
+                    tmp_mae, tmp_mse = simple_metric(pred, true)
+                    mse += tmp_mse
+                    mae += tmp_mae
+                    batch_num += 1
+                    # visual
+                    input = batch_x.detach().cpu().numpy()
+                    gt = np.concatenate((input[0, :, 0], true[0, :, 0]), axis=0)
+                    pd = np.concatenate((input[0, :, 0], pred[0, :, 0]), axis=0)
+                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+                    
+
+                    progress.update(task, advance=1)
 
         mse = mse / float(batch_num)
         mae = mae / float(batch_num)
@@ -261,29 +377,42 @@ class Exp_Main(Exp_Basic):
 
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn()
+            ) as progress:
+                total_batches = len(pred_loader)
+                task = progress.add_task("Predicting...", total=total_batches)
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    batch_y = batch_y.float()
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                    # decoder input
+                    dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                    # encoder - decoder
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
                         if self.args.output_attention:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                pred = outputs.detach().cpu().numpy()  # .squeeze()
-                preds.append(pred)
+                    # Clamp outputs to physical humidity bounds [0, 100] during prediction
+                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
+                    pred = outputs.detach().cpu().numpy()  # .squeeze()
+                    preds.append(pred)
+
+                    progress.update(task, advance=1)
 
         preds = np.array(preds)
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])

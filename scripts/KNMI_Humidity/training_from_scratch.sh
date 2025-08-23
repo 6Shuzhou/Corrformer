@@ -2,11 +2,11 @@ export CUDA_VISIBLE_DEVICES=0
 
 python -u run.py \
   --is_training 1 \
-  --root_path /data/global_wind/ \
+  --root_path /root/Codes/code/data/knmi_humidity/ \
   --data_path None \
-  --model_id global_wind_48_24_1ETCN_1DTCN \
+  --model_id knmi_humidity_48_24_1ETCN_1DTCN \
   --model Corrformer \
-  --data Global_Wind \
+  --data Knmi_Humidity \
   --features M \
   --seq_len 48 \
   --label_len 24 \
@@ -18,13 +18,15 @@ python -u run.py \
   --factor_spatial 1 \
   --enc_tcn_layers 1 \
   --dec_tcn_layers 1 \
-  --enc_in 11 \
-  --dec_in 11 \
-  --c_out 11 \
-  --node_num 350 \
-  --node_list 7,50 \
-  --des 'Exp' \
+  --enc_in 1 \
+  --dec_in 1 \
+  --c_out 1 \
+  --node_num 32\
+  --node_list 4,8 \
+  --des 'Exp_training_from_scratch' \
   --itr 1 \
   --d_model 768 \
-  --batch_size 1 \
-  --n_heads 16
+  --batch_size 12 \
+  --n_heads 16 \
+  --train_epochs 8 \
+  --patience 1 \
