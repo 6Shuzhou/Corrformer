@@ -1,4 +1,4 @@
-from data_provider.data_loader import Global_Temp, Global_Wind,Knmi_Prep,Knmi_Humidity,Knmi_Temp
+from data_provider.data_loader import Global_Temp, Global_Wind,Knmi_Prep,Knmi_Humidity,Knmi_Temp,Knmi_Wind_speed
 from torch.utils.data import DataLoader
 
 data_dict = {
@@ -7,6 +7,7 @@ data_dict = {
     'Knmi_Prep': Knmi_Prep,  
     'Knmi_Humidity': Knmi_Humidity,
     'Knmi_Temp': Knmi_Temp,
+    'Knmi_Wind_speed': Knmi_Wind_speed
 }
 
 

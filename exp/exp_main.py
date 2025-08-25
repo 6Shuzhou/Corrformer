@@ -3,6 +3,7 @@ from exp.exp_basic import Exp_Basic
 from models import Corrformer
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric, simple_metric
+from utils.transfer_learning import TransferLearningManager, DimensionAdapter
 import copy
 import numpy as np
 import torch
@@ -26,6 +27,12 @@ warnings.filterwarnings('ignore')
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
+        
+        # 初始化迁移学习管理器
+        if hasattr(args, 'transfer_type') and args.transfer_type != 'none':
+            self.transfer_manager = None  # 延迟初始化，等模型构建完成
+        else:
+            self.transfer_manager = None
 
     def _build_model(self):
         model_dict = {
@@ -36,6 +43,11 @@ class Exp_Main(Exp_Basic):
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
+            
+        # 初始化迁移学习管理器
+        if hasattr(self.args, 'transfer_type') and self.args.transfer_type != 'none':
+            self.transfer_manager = TransferLearningManager(model, self.args)
+            
         return model
     
     
@@ -46,8 +58,14 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
+        # 如果使用多层级迁移学习，创建分层学习率优化器
+        if (self.transfer_manager and 
+            hasattr(self.args, 'transfer_type') and 
+            self.args.transfer_type == 'multilevel'):
+            return self.transfer_manager.create_layer_wise_optimizer()
+        else:
+            # 标准优化器
+            return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
         criterion = nn.MSELoss()
@@ -99,7 +117,6 @@ class Exp_Main(Exp_Basic):
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     # ipdb.set_trace()
                     # Clamp outputs to physical humidity bounds [0, 100] during validation
-                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
                     f_dim = -1 if self.args.features == 'MS' else 0
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
@@ -128,50 +145,13 @@ class Exp_Main(Exp_Basic):
         if self.args.use_gpu:
            self.model = self.model.cuda()    
            
-        # if self.args.pretrained_model == '':
-        #    ckpt = torch.load(os.path.join('data/' + setting, 'checkpoint.pth'))
-        # else:
-        #     ckpt = torch.load(os.path.join('data/' + self.args.pretrained_model,
-        #                                'checkpoint.pth'))
-    
-        #     model_dict = self.model.state_dict()
-        #     matched_dict = {
-        #            k: v for k, v in ckpt.items()
-        #          if k in model_dict and v.size() == model_dict[k].size()
-        #     }
-
-        #     model_dict.update(matched_dict)
-        #     self.model.load_state_dict(model_dict)
-            
-
-        #     print('loading model finished')   
-           
-
-    
-        # print("Standard full fine-tuning. All parameters are trainable.")
-        # for param in self.model.parameters():
-        #     param.requires_grad = True
+        # 应用迁移学习策略
+        if self.transfer_manager and self.args.pretrained_model:
+            if self.args.transfer_type == 'simple':
+                self.transfer_manager.apply_simple_transfer(self.args.pretrained_model)
+            elif self.args.transfer_type == 'multilevel':
+                self.transfer_manager.apply_multilevel_transfer(self.args.pretrained_model)
         
-        # # --- 打印参数状态以供检查 ---
-        # print("\n" + "="*25 + " Model Parameters Status " + "="*25)
-        # trainable_params = 0
-        # total_params = 0
-        # trainable_layers = []
-        
-        # for name, param in self.model.named_parameters():
-        #     total_params += param.numel()
-        #     if param.requires_grad:
-        #         trainable_params += param.numel()
-        #         trainable_layers.append(name)
-        
-        # print(f"Total parameters: {total_params:,}")
-        # print(f"Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
-        # print(f"\nTrainable layers/parameters ({len(trainable_layers)}):")
-        # for name in trainable_layers:
-        #     print(f"  - {name}")
-        # print("="*75 + "\n")
-
-
         time_now = time.time()
 
         train_steps = len(train_loader)
@@ -184,6 +164,12 @@ class Exp_Main(Exp_Basic):
             scaler = torch.cuda.amp.GradScaler()
 
         for epoch in range(self.args.train_epochs):
+            # 多层级迁移学习的渐进式解冻
+            if (self.transfer_manager and 
+                hasattr(self.args, 'transfer_type') and 
+                self.args.transfer_type == 'multilevel'):
+                self.transfer_manager.update_frozen_layers(epoch + 1)
+                
             iter_count = 0
             train_loss = []
             self.model.train()
@@ -328,8 +314,6 @@ class Exp_Main(Exp_Basic):
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                    # Clamp outputs to physical humidity bounds [0, 100] during testing
-                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
 
                     # metric
                     f_dim = -1 if self.args.features == 'MS' else 0
@@ -407,8 +391,7 @@ class Exp_Main(Exp_Basic):
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    # Clamp outputs to physical humidity bounds [0, 100] during prediction
-                    outputs = self._clip_to_physical_range(outputs, 0.0, 100.0)
+
                     pred = outputs.detach().cpu().numpy()  # .squeeze()
                     preds.append(pred)
 
